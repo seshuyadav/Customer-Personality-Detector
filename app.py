@@ -95,9 +95,19 @@ st.markdown("""
 @st.cache_data
 def get_dashboard_data():
     processed_path = os.path.join("data", "processed_customers.csv")
+    kmeans_path = os.path.join("models", "kmeans_model.pkl")
+
+    # If processed data or models are missing (e.g. on Streamlit Cloud deploy), auto-train on startup
+    if not (os.path.exists(processed_path) and os.path.exists(kmeans_path)):
+        try:
+            from train import main as run_training_pipeline
+            run_training_pipeline()
+        except Exception as e:
+            st.warning(f"Auto-training on startup encountered an issue: {e}")
+
     if os.path.exists(processed_path):
         return pd.read_csv(processed_path)
-    
+
     # Fallback load raw & process on the fly
     raw_path = fetch_or_generate_dataset()
     raw_df = load_raw_data(raw_path)
@@ -282,7 +292,6 @@ def render_analytics_dashboard(df: pd.DataFrame):
                 color='Personality' if 'Personality' in df else None,
                 opacity=0.7,
                 template="plotly_dark",
-                trendline="ols",
                 title="Annual Income vs. Total Spending by Segment",
                 color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()}
             )
@@ -330,15 +339,16 @@ def render_analytics_dashboard(df: pd.DataFrame):
     with c7:
         st.subheader("🌐 Web Visits vs. Store Purchases")
         if 'NumWebVisitsMonth' in df.columns and 'NumStorePurchases' in df.columns:
+            has_personality = 'Personality' in df.columns
             fig_web_store = px.scatter(
                 df,
                 x='NumWebVisitsMonth',
                 y='NumStorePurchases',
-                color='Personality',
-                size='Total_Spending',
+                color='Personality' if has_personality else None,
+                size='Total_Spending' if 'Total_Spending' in df.columns else None,
                 template="plotly_dark",
                 title="Monthly Web Visits vs Store Purchases",
-                color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()}
+                color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()} if has_personality else None
             )
             fig_web_store.update_layout(height=380)
             st.plotly_chart(fig_web_store, use_container_width=True)
