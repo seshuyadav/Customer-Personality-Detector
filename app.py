@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from src.prediction import predict_customer_personality, load_artifacts, RECOMMENDATIONS
 from src.data_preprocessing import fetch_or_generate_dataset, load_raw_data, clean_data
-from src.feature_engineering import create_features
+from src.feature_engineering import create_features, prepare_clustering_matrix
 
 # Page Configuration
 st.set_page_config(
@@ -97,22 +97,42 @@ def get_dashboard_data():
     processed_path = os.path.join("data", "processed_customers.csv")
     kmeans_path = os.path.join("models", "kmeans_model.pkl")
 
-    # If processed data or models are missing (e.g. on Streamlit Cloud deploy), auto-train on startup
+    # Auto-train on startup if model artifacts or processed dataset are missing (e.g. Streamlit Cloud)
     if not (os.path.exists(processed_path) and os.path.exists(kmeans_path)):
         try:
             from train import main as run_training_pipeline
             run_training_pipeline()
         except Exception as e:
-            st.warning(f"Auto-training on startup encountered an issue: {e}")
+            st.warning(f"Auto-training pipeline on startup note: {e}")
 
     if os.path.exists(processed_path):
         return pd.read_csv(processed_path)
 
-    # Fallback load raw & process on the fly
+    # Fallback: load raw, clean, engineer features, and assign cluster labels on the fly
     raw_path = fetch_or_generate_dataset()
     raw_df = load_raw_data(raw_path)
     cleaned_df = clean_data(raw_df)
     df_feat = create_features(cleaned_df)
+
+    try:
+        X_scaled, scaler, _ = prepare_clustering_matrix(cleaned_df)
+        artifacts = load_artifacts("models")
+        kmeans = artifacts["kmeans"]
+        pca = artifacts["pca"]
+        metadata = artifacts["metadata"]
+        
+        labels = kmeans.predict(X_scaled)
+        mapping = metadata.get("cluster_mapping", {})
+        df_feat["Cluster"] = labels
+        df_feat["Personality"] = df_feat["Cluster"].map(mapping)
+
+        if pca is not None:
+            X_pca = pca.transform(X_scaled)
+            df_feat["PCA_1"] = X_pca[:, 0]
+            df_feat["PCA_2"] = X_pca[:, 1]
+    except Exception:
+        pass
+
     return df_feat
 
 
@@ -241,21 +261,24 @@ def render_analytics_dashboard(df: pd.DataFrame):
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    has_personality = 'Personality' in df.columns
+
     # Row 1 Charts: PCA Visualization & Segment Distribution
     col1, col2 = st.columns([3, 2])
 
     with col1:
         st.subheader("📍 2D PCA Cluster Map")
         if 'PCA_1' in df.columns and 'PCA_2' in df.columns:
+            hover_cols = [c for c in ['Age', 'Income', 'Total_Spending', 'Total_Purchases'] if c in df.columns]
             fig_pca = px.scatter(
                 df,
                 x='PCA_1',
                 y='PCA_2',
-                color='Personality',
-                hover_data=['Age', 'Income', 'Total_Spending', 'Total_Purchases'],
+                color='Personality' if has_personality else None,
+                hover_data=hover_cols if hover_cols else None,
                 title="Customer Clusters Projected onto First 2 Principal Components",
                 template="plotly_dark",
-                color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()}
+                color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()} if has_personality else None
             )
             fig_pca.update_layout(height=450, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_pca, use_container_width=True)
@@ -264,7 +287,7 @@ def render_analytics_dashboard(df: pd.DataFrame):
 
     with col2:
         st.subheader("🍩 Segment Share Distribution")
-        if 'Personality' in df.columns:
+        if has_personality:
             seg_counts = df['Personality'].value_counts().reset_index()
             seg_counts.columns = ['Personality', 'Count']
             fig_pie = px.pie(
@@ -278,6 +301,8 @@ def render_analytics_dashboard(df: pd.DataFrame):
             )
             fig_pie.update_layout(height=450, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.info("Personality segments being generated...")
 
     # Row 2 Charts: Income vs Spending Scatter & Product Category Spending
     col3, col4 = st.columns(2)
@@ -289,11 +314,11 @@ def render_analytics_dashboard(df: pd.DataFrame):
                 df,
                 x='Income',
                 y='Total_Spending',
-                color='Personality' if 'Personality' in df else None,
+                color='Personality' if has_personality else None,
                 opacity=0.7,
                 template="plotly_dark",
                 title="Annual Income vs. Total Spending by Segment",
-                color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()}
+                color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()} if has_personality else None
             )
             fig_inc_spend.update_layout(height=400)
             st.plotly_chart(fig_inc_spend, use_container_width=True)
@@ -302,7 +327,7 @@ def render_analytics_dashboard(df: pd.DataFrame):
         st.subheader("🍷 Product Category Spending Breakdown")
         spend_cols = ['MntWines', 'MntMeatProducts', 'MntFruits', 'MntFishProducts', 'MntSweetProducts', 'MntGoldProds']
         existing_spend = [c for c in spend_cols if c in df.columns]
-        if existing_spend and 'Personality' in df.columns:
+        if existing_spend and has_personality:
             spend_df = df.groupby('Personality')[existing_spend].mean().reset_index()
             spend_melted = spend_df.melt(id_vars='Personality', var_name='Category', value_name='Avg_Spend')
             spend_melted['Category'] = spend_melted['Category'].str.replace('Mnt', '')
@@ -323,7 +348,7 @@ def render_analytics_dashboard(df: pd.DataFrame):
     c6, c7 = st.columns(2)
     with c6:
         st.subheader("🎂 Age Distribution per Personality")
-        if 'Age' in df.columns and 'Personality' in df.columns:
+        if 'Age' in df.columns and has_personality:
             fig_box = px.box(
                 df,
                 x='Personality',
@@ -339,13 +364,11 @@ def render_analytics_dashboard(df: pd.DataFrame):
     with c7:
         st.subheader("🌐 Web Visits vs. Store Purchases")
         if 'NumWebVisitsMonth' in df.columns and 'NumStorePurchases' in df.columns:
-            has_personality = 'Personality' in df.columns
             fig_web_store = px.scatter(
                 df,
                 x='NumWebVisitsMonth',
                 y='NumStorePurchases',
                 color='Personality' if has_personality else None,
-                size='Total_Spending' if 'Total_Spending' in df.columns else None,
                 template="plotly_dark",
                 title="Monthly Web Visits vs Store Purchases",
                 color_discrete_map={k: v['color'] for k, v in RECOMMENDATIONS.items()} if has_personality else None
